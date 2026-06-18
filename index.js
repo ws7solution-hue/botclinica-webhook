@@ -25,50 +25,34 @@ INSTRUÇÕES:
 - Confirme agendamentos existentes quando perguntado
 - Informe valores das consultas quando perguntado
 - Para emergências, informe o telefone da clínica
-- Se não souber responder algo específico, diga que vai verificar e pedir para um atendente entrar em contato
+- Se não souber responder algo específico, diga que vai verificar com um atendente
 
 Responda em português brasileiro, de forma breve e direta (máximo 3 frases).
-Não use markdown, asteriscos ou listas. Use linguagem natural de WhatsApp com emojis ocasionais.`;
+Não use markdown ou asteriscos. Use linguagem natural de WhatsApp com emojis ocasionais.`;
 
-// Histórico de conversa por número
 const conversations = {};
 
-app.get('/', (req, res) => {
-  res.json({ status: 'Webhook BotClínica online! ✅', clinica: 'Clínica Saúde Total' });
-});
-
-app.post('/webhook', async (req, res) => {
-  res.status(200).send('OK');
-
+async function processMessage(body) {
   try {
-    const body = req.body;
-
-    // Ignora mensagens próprias e grupos
     if (body?.data?.key?.fromMe) return;
     if (body?.data?.key?.remoteJid?.includes('@g.us')) return;
 
-    // Pega o texto da mensagem
     const text =
       body?.data?.message?.conversation ||
       body?.data?.message?.extendedTextMessage?.text ||
       body?.data?.message?.imageMessage?.caption;
 
     const from = body?.data?.key?.remoteJid;
-
     if (!from || !text) return;
 
-    console.log(`📩 Mensagem de ${from}: ${text}`);
+    console.log(`📩 De ${from}: ${text}`);
 
-    // Histórico de conversa
     if (!conversations[from]) conversations[from] = [];
     conversations[from].push({ role: 'user', content: text });
-
-    // Mantém só as últimas 10 mensagens
     if (conversations[from].length > 10) {
       conversations[from] = conversations[from].slice(-10);
     }
 
-    // Chama o Claude
     const claudeRes = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: {
@@ -86,40 +70,27 @@ app.post('/webhook', async (req, res) => {
 
     const claudeData = await claudeRes.json();
     const reply = claudeData.content?.[0]?.text;
+    if (!reply) { console.log('❌ Sem resposta Claude:', claudeData); return; }
 
-    if (!reply) {
-      console.log('❌ Sem resposta do Claude:', claudeData);
-      return;
-    }
-
-    console.log(`🤖 Resposta: ${reply}`);
-
-    // Adiciona resposta ao histórico
+    console.log(`🤖 Sofia: ${reply}`);
     conversations[from].push({ role: 'assistant', content: reply });
 
-    // Envia resposta via Evolution API
-    const sendRes = await fetch(`${EVOLUTION_URL}/message/sendText/${INSTANCE}`, {
+    await fetch(`${EVOLUTION_URL}/message/sendText/${INSTANCE}`, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        apikey: EVOLUTION_KEY,
-      },
-      body: JSON.stringify({
-        number: from,
-        text: reply,
-      }),
+      headers: { 'Content-Type': 'application/json', apikey: EVOLUTION_KEY },
+      body: JSON.stringify({ number: from, text: reply }),
     });
 
-    const sendData = await sendRes.json();
-    console.log('✅ Mensagem enviada:', sendData?.key?.id || 'ok');
-
+    console.log('✅ Enviado!');
   } catch (err) {
-    console.error('❌ Erro no webhook:', err.message);
+    console.error('❌ Erro:', err.message);
   }
-});
+}
+
+// Aceita qualquer rota POST que comece com /webhook
+app.post('/webhook', (req, res) => { res.status(200).send('OK'); processMessage(req.body); });
+app.post('/webhook/*', (req, res) => { res.status(200).send('OK'); processMessage(req.body); });
+app.get('/', (req, res) => res.json({ status: 'Webhook BotClínica online! ✅', clinica: 'Clínica Saúde Total' }));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`🚀 Webhook BotClínica rodando na porta ${PORT}`);
-  console.log(`📋 Clínica Saúde Total — Sofia ativa`);
-});
+app.listen(PORT, () => console.log(`🚀 Webhook rodando na porta ${PORT}`));
