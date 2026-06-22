@@ -7,20 +7,21 @@ const EVOLUTION_KEY = 'botclinica2025';
 const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
 const INSTANCE = 'botclinica';
 const CLINIC_UID = 'fMi67Aq1QzfM9Xhnj7eH2vJBTe92';
-const FIREBASE_PROJECT = 'botclinica-60b6f';
+const FB_PROJECT = 'botclinica-60b6f';
 const FB_KEY = 'AIzaSyAwYQq-ddQT8fBFytQYF5bgY5geL3SM2Ew';
-const BASE = `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT}/databases/(default)/documents`;
+const BASE = `https://firestore.googleapis.com/v1/projects/${FB_PROJECT}/databases/(default)/documents`;
 
-const conversations = {};
+// In-memory state (scheduling flow only — conversations persisted on Firebase)
 const schedulingStates = {};
 let clinicCache = null;
 let lastFetch = 0;
 
-// ── HELPERS ──
+// ── HELPERS ──────────────────────────────────────────────────────────────────
 function parseTimeM(s){const[h,m]=s.split(':');return+h*60+ +m;}
 function formatTimeM(m){return`${String(Math.floor(m/60)).padStart(2,'0')}:${String(m%60).padStart(2,'0')}`;}
 function formatPhone(jid){return'+'+jid.replace('@s.whatsapp.net','').replace('@c.us','');}
 function aptId(docId,date,time){return`${date}_${docId}_${time.replace(':','')}`;}
+function sleep(ms){return new Promise(r=>setTimeout(r,ms));}
 
 function parseDateFromText(text){
   const t=text.toLowerCase();
@@ -53,78 +54,178 @@ function generateSlots(doc,date){
   return slots;
 }
 
-// ── INTENT DETECTION ──
+// ── INTENT ───────────────────────────────────────────────────────────────────
 function detectIntent(text){
   const t=text.toLowerCase();
-  if(['cancelar','desmarcar','não posso','nao posso','não vou poder','nao vou poder','cancelamento','desmarca','cancela','não quero mais','nao quero mais','desistir'].some(k=>t.includes(k)))return'cancel';
+  if(['cancelar','desmarcar','não posso','nao posso','cancelamento','desmarca','cancela','não quero mais','desistir'].some(k=>t.includes(k)))return'cancel';
   if(['remarcar','remarca','reagendar','mudar data','mudar horário','adiar','outro dia','outra data'].some(k=>t.includes(k)))return'reschedule';
   if(['agendar','marcar consulta','quero consulta','preciso consulta','marcar horário','disponibilidade','quero marcar'].some(k=>t.includes(k)))return'schedule';
-  if(['confirmar','confirmo','confirmar consulta'].some(k=>t.includes(k)))return'confirm';
   if(['atendente','humano','pessoa','recepcionista','falar com alguém','falar com um'].some(k=>t.includes(k)))return'human';
   return'general';
 }
 
-// ── FIREBASE ──
-async function fbGet(path){
-  try{const r=await fetch(`${BASE}/${path}?key=${FB_KEY}`);return r.json();}
-  catch(e){console.error('fbGet:',e.message);return{};}
+// ── FIREBASE ─────────────────────────────────────────────────────────────────
+async function fbGet(path,retries=2){
+  for(let i=0;i<=retries;i++){
+    try{
+      const r=await fetch(`${BASE}/${path}?key=${FB_KEY}`);
+      if(!r.ok)throw new Error(`HTTP ${r.status}`);
+      return r.json();
+    }catch(e){
+      if(i===retries){console.error(`fbGet failed [${path}]:`,e.message);return{};}
+      await sleep(1000*(i+1));
+    }
+  }
 }
 
 async function fbPatch(path,body){
   try{
     const r=await fetch(`${BASE}/${path}?key=${FB_KEY}`,{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-    if(!r.ok){const e=await r.text();console.error(`❌ PATCH [${r.status}]: ${e.slice(0,200)}`);return null;}
+    if(!r.ok){const e=await r.text();console.error(`PATCH [${r.status}]:`,e.slice(0,150));return null;}
     return r.json();
   }catch(e){console.error('fbPatch:',e.message);return null;}
 }
 
+// ── CLINIC DATA (30s cache) ───────────────────────────────────────────────────
 async function getClinicData(){
   const now=Date.now();
-  if(clinicCache&&now-lastFetch<5*60*1000)return clinicCache;
+  if(clinicCache&&now-lastFetch<30000)return clinicCache;
   try{
-    const cData=await fbGet(`clinicas/${CLINIC_UID}`);
+    const[cData,dData]=await Promise.all([
+      fbGet(`clinicas/${CLINIC_UID}`),
+      fbGet(`clinicas/${CLINIC_UID}/medicos`)
+    ]);
     const f=cData.fields||{};
-    const clinic={name:f.clinicName?.stringValue||'Clínica',phone:f.phone?.stringValue||'',hours:f.hours?.stringValue||'',botName:f.botName?.stringValue||'Sofia'};
-    const dData=await fbGet(`clinicas/${CLINIC_UID}/medicos`);
+    const clinic={
+      name:f.clinicName?.stringValue||'Clínica',
+      phone:f.phone?.stringValue||'',
+      hours:f.hours?.stringValue||'',
+      botName:f.botName?.stringValue||'Sofia',
+    };
     const doctors=(dData.documents||[]).map(d=>{
       const fi=d.fields||{};
       const schedDays=(fi.schedDays?.arrayValue?.values||[]).map(v=>parseInt(v.integerValue||v.doubleValue||0));
       return{
-        id:d.name.split('/').pop(),name:fi.name?.stringValue||'',spec:fi.spec?.stringValue||'',
-        days:fi.days?.stringValue||'',times:fi.times?.stringValue||'',preco:fi.preco?.stringValue||'',
-        active:fi.active?.booleanValue!==false,schedDays,
-        schedStart:fi.schedStart?.stringValue||'',schedEnd:fi.schedEnd?.stringValue||'',
+        id:d.name.split('/').pop(),
+        name:fi.name?.stringValue||'',
+        spec:fi.spec?.stringValue||'',
+        bot:fi.bot?.stringValue||clinic.botName,
+        tone:fi.tone?.stringValue||'cordial',
+        days:fi.days?.stringValue||'',
+        times:fi.times?.stringValue||'',
+        preco:fi.preco?.stringValue||'',
+        active:fi.active?.booleanValue!==false,
+        schedDays,
+        schedStart:fi.schedStart?.stringValue||'',
+        schedEnd:fi.schedEnd?.stringValue||'',
         schedDuration:parseInt(fi.schedDuration?.integerValue||fi.schedDuration?.doubleValue||30),
-        schedLunchStart:fi.schedLunchStart?.stringValue||'',schedLunchEnd:fi.schedLunchEnd?.stringValue||'',
+        schedLunchStart:fi.schedLunchStart?.stringValue||'',
+        schedLunchEnd:fi.schedLunchEnd?.stringValue||'',
       };
     }).filter(d=>d.active&&d.name);
-    clinicCache={clinic,doctors};lastFetch=now;
-    const profile=doctors.length===1?'single':'multi';
-    console.log(`📋 ${clinic.name} | Perfil: ${profile} médico | Médicos: ${doctors.map(d=>d.name).join(', ')}`);
+    if(!doctors.length){console.warn('⚠️ Nenhum médico ativo encontrado!');}
+    clinicCache={clinic,doctors};
+    lastFetch=now;
+    console.log(`📋 ${clinic.name} | ${doctors.length} médico(s): ${doctors.map(d=>`${d.name} (bot: ${d.bot})`).join(', ')}`);
     return clinicCache;
-  }catch(e){console.error('getClinicData:',e.message);return clinicCache||{clinic:{name:'Clínica',botName:'Sofia'},doctors:[]};}
+  }catch(e){
+    console.error('getClinicData:',e.message);
+    if(clinicCache)return clinicCache; // use stale cache on error
+    return{clinic:{name:'Clínica',botName:'Sofia'},doctors:[]};
+  }
 }
 
-// ── ANTI DOUBLE BOOKING ──
+// ── CONVERSATION HISTORY (persisted on Firebase) ──────────────────────────────
+async function loadHistory(phone){
+  try{
+    const key=phone.replace(/[^a-zA-Z0-9]/g,'_');
+    const data=await fbGet(`clinicas/${CLINIC_UID}/conv_history/${key}`);
+    if(!data.fields)return[];
+    return(data.fields.msgs?.arrayValue?.values||[]).map(v=>({
+      role:v.mapValue?.fields?.role?.stringValue||'user',
+      content:v.mapValue?.fields?.content?.stringValue||''
+    })).filter(m=>m.content);
+  }catch{return[];}
+}
+
+async function saveHistory(phone,history){
+  try{
+    const key=phone.replace(/[^a-zA-Z0-9]/g,'_');
+    await fbPatch(`clinicas/${CLINIC_UID}/conv_history/${key}`,{
+      fields:{
+        msgs:{arrayValue:{values:history.slice(-20).map(m=>({
+          mapValue:{fields:{role:{stringValue:m.role},content:{stringValue:m.content}}}
+        }))}},
+        updatedAt:{stringValue:new Date().toISOString()}
+      }
+    });
+  }catch(e){console.error('saveHistory:',e.message);}
+}
+
+// ── PROMPTS ───────────────────────────────────────────────────────────────────
+const TONE_DESC={
+  cordial:'cordial, acolhedora e simpática — use linguagem calorosa e emojis com moderação',
+  formal:'formal e profissional — use linguagem objetiva e respeitosa, sem emojis, trate por "senhor/senhora"',
+  descontraido:'descontraída e próxima — use linguagem informal e emojis frequentes',
+};
+
+function buildDoctorPrompt(clinic,doc){
+  const gender=doc.name.startsWith('Dra')?'a':'o';
+  const tone=TONE_DESC[doc.tone]||TONE_DESC.cordial;
+  const dn=['Dom','Seg','Ter','Qua','Qui','Sex','Sáb'];
+  const days=doc.schedDays?.length?doc.schedDays.map(i=>dn[i]).join(', '):doc.days||'consulte a clínica';
+  const hours=doc.schedStart&&doc.schedEnd?`${doc.schedStart} às ${doc.schedEnd}`:doc.times||'consulte a clínica';
+
+  return`Você é ${doc.bot}, assistente virtual exclusiv${gender} d${gender} ${doc.name}.
+
+IDENTIDADE: Você se chama ${doc.bot}. Nunca revele que é uma IA. Nunca diga que é Sofia ou qualquer outro nome.
+TOM: Seja ${tone}.
+
+MÉDICO: ${doc.name} — ${doc.spec||'Medicina'}
+CLÍNICA: ${clinic.name}${clinic.phone?'\nTELEFONE: '+clinic.phone:''}${clinic.hours?'\nFUNCIONAMENTO: '+clinic.hours:''}
+DIAS DE ATENDIMENTO: ${days}
+HORÁRIOS: ${hours}
+
+INSTRUÇÕES:
+1. Apresente-se como ${doc.bot} na primeira mensagem
+2. Responda sobre ${doc.name} e ${doc.spec||'esta especialidade'}
+3. Para agendar: pergunte a data → mostre horários → confirme nome
+4. NUNCA mencione outros médicos ou especialidades
+5. Para dúvidas médicas complexas: encaminhe ao médico pessoalmente
+6. Para emergências: oriente a ligar para o SAMU 192 ou ir a UPA
+
+Responda em português. Máximo 3 frases curtas. ${doc.tone==='formal'?'Sem emojis.':doc.tone==='descontraido'?'Use emojis livremente.':'Emojis com moderação.'}`;
+}
+
+function buildClinicPrompt(clinic,doctors){
+  const list=doctors.map((d,i)=>`${i+1}. ${d.name} — ${d.spec}`).join('\n');
+  return`Você é ${clinic.botName}, recepcionista virtual da ${clinic.name}.
+
+CLÍNICA: ${clinic.name}${clinic.phone?'\nTELEFONE: '+clinic.phone:''}${clinic.hours?'\nHORÁRIOS: '+clinic.hours:''}
+
+MÉDICOS DISPONÍVEIS:
+${list}
+
+INSTRUÇÕES:
+1. Apresente-se e pergunte com qual especialidade/médico o paciente quer falar
+2. Após o paciente escolher, informe que está transferindo para o assistente daquele médico
+3. Seja cordial e profissional
+4. Para emergências: oriente SAMU 192
+
+Responda em português. Máximo 3 frases. Emojis com moderação.`;
+}
+
+// ── BOOKING ───────────────────────────────────────────────────────────────────
 async function isSlotTaken(docId,date,time){
-  // Check directly by document ID — fastest and most reliable
-  const id=aptId(docId,date,time);
-  const data=await fbGet(`clinicas/${CLINIC_UID}/agendamentos/${id}`);
-  if(data.fields){
-    const status=data.fields.status?.stringValue||'confirmed';
-    if(status!=='cancelled'){
-      console.log(`🔒 Slot OCUPADO: ${id}`);
-      return true;
-    }
-  }
-  return false;
+  const data=await fbGet(`clinicas/${CLINIC_UID}/agendamentos/${aptId(docId,date,time)}`);
+  return!!(data.fields&&data.fields.status?.stringValue!=='cancelled');
 }
 
 async function getBookedTimes(docId,date){
   try{
     const data=await fbGet(`clinicas/${CLINIC_UID}/agendamentos`);
     return(data.documents||[])
-      .map(d=>({docId:d.fields?.docId?.stringValue||'',date:d.fields?.date?.stringValue||'',time:d.fields?.time?.stringValue||'',status:d.fields?.status?.stringValue||'confirmed'}))
+      .map(d=>({docId:d.fields?.docId?.stringValue,date:d.fields?.date?.stringValue,time:d.fields?.time?.stringValue,status:d.fields?.status?.stringValue}))
       .filter(a=>a.docId===docId&&a.date===date&&a.status!=='cancelled')
       .map(a=>a.time);
   }catch{return[];}
@@ -139,114 +240,95 @@ async function getPatientAppointments(phone){
       return{id:d.name.split('/').pop(),docId:f.docId?.stringValue||'',docName:f.docName?.stringValue||'',patientName:f.patientName?.stringValue||'',patientPhone:f.patientPhone?.stringValue||'',date:f.date?.stringValue||'',time:f.time?.stringValue||'',status:f.status?.stringValue||'confirmed'};
     }).filter(a=>(a.patientPhone===phone||a.patientPhone===phone.replace('+',''))&&a.date>=today&&a.status!=='cancelled')
     .sort((a,b)=>a.date===b.date?a.time.localeCompare(b.time):a.date.localeCompare(b.date));
-  }catch(e){return[];}
+  }catch{return[];}
 }
 
 async function cancelApt(id){
-  const r=await fbPatch(`clinicas/${CLINIC_UID}/agendamentos/${id}`,{fields:{status:{stringValue:'cancelled'},cancelledAt:{stringValue:new Date().toISOString()}}});
-  if(r)console.log(`✅ Cancelado: ${id}`);
-  return!!r;
+  return!!(await fbPatch(`clinicas/${CLINIC_UID}/agendamentos/${id}`,{fields:{status:{stringValue:'cancelled'},cancelledAt:{stringValue:new Date().toISOString()}}}));
+}
+
+async function registerPatient(patientName,patientPhone,docName,date,time){
+  try{
+    if(!patientPhone)return;
+    const key=patientPhone.replace(/[^0-9]/g,'');
+    const existing=await fbGet(`clinicas/${CLINIC_UID}/pacientes/${key}`);
+    const f=existing.fields||{};
+    const visits=(f.visits?.integerValue||0)+1;
+    const lastVisit=f.lastVisit?.stringValue||'';
+    await fbPatch(`clinicas/${CLINIC_UID}/pacientes/${key}`,{
+      fields:{
+        name:{stringValue:patientName},phone:{stringValue:patientPhone},
+        visits:{integerValue:String(visits)},
+        lastVisit:{stringValue:date},lastDoctor:{stringValue:docName},
+        firstVisit:{stringValue:lastVisit||date},
+        updatedAt:{stringValue:new Date().toISOString()}
+      }
+    });
+    console.log(`👤 Paciente registrado: ${patientName} (${visits} visita${visits>1?'s':''})`);
+  }catch(e){console.error('registerPatient:',e.message);}
 }
 
 async function bookSlot(docId,docName,patientName,patientPhone,date,time){
-  // FINAL CHECK before saving — prevents race condition
-  const taken=await isSlotTaken(docId,date,time);
-  if(taken)return'taken';
+  if(await isSlotTaken(docId,date,time))return'taken';
   const id=aptId(docId,date,time);
-  console.log(`📅 Salvando: ${patientName} | ${docName} | ${date} ${time}`);
+  console.log(`📅 Agendando: ${patientName} | ${docName} | ${date} ${time}`);
   const r=await fbPatch(`clinicas/${CLINIC_UID}/agendamentos/${id}`,{
     fields:{docId:{stringValue:docId},docName:{stringValue:docName},patientName:{stringValue:patientName},patientPhone:{stringValue:patientPhone||''},date:{stringValue:date},time:{stringValue:time},status:{stringValue:'confirmed'},createdAt:{stringValue:new Date().toISOString()}}
   });
-  if(r){console.log(`✅ Agendamento salvo: ${id}`);return'ok';}
-  console.error(`❌ Falha ao salvar: ${id}`);return'error';
+  if(r){
+    console.log(`✅ Salvo: ${id}`);
+    registerPatient(patientName,patientPhone,docName,date,time);
+    return'ok';
+  }
+  return'error';
 }
 
-async function saveConversation(phone,name,lastMsg,status,msgs){
+async function saveConversation(phone,name,lastMsg,status){
   try{
     const docId=phone.replace(/[^a-zA-Z0-9]/g,'_');
     const now=new Date().toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'});
     await fbPatch(`clinicas/${CLINIC_UID}/conversas/${docId}`,{
-      fields:{name:{stringValue:name},phone:{stringValue:phone},last:{stringValue:lastMsg},time:{stringValue:now},status:{stringValue:status},
-        msgs:{arrayValue:{values:msgs.slice(-20).map(m=>({mapValue:{fields:{f:{stringValue:m.f},t:{stringValue:m.t},h:{stringValue:m.h||now}}}}))}},
-        updatedAt:{stringValue:new Date().toISOString()}}
+      fields:{name:{stringValue:name},phone:{stringValue:phone},last:{stringValue:lastMsg},time:{stringValue:now},status:{stringValue:status},updatedAt:{stringValue:new Date().toISOString()}}
     });
   }catch(e){console.error('saveConv:',e.message);}
 }
 
-// ── PROMPT — adapts to single vs multi doctor ──
-function buildPrompt(clinic,doctors){
-  const isSingle=doctors.length===1;
-  const doc=isSingle?doctors[0]:null;
-  const docList=doctors.length>0
-    ?doctors.map(d=>{
-      let l=`- ${d.name}`;
-      if(d.spec)l+=` (${d.spec})`;
-      // Price shown at confirmation step only, not here
-      if(d.schedDays?.length){const dn=['Dom','Seg','Ter','Qua','Qui','Sex','Sáb'];l+=` — Atende: ${d.schedDays.map(i=>dn[i]).join(', ')} das ${d.schedStart} às ${d.schedEnd}`;}
-      else if(d.days)l+=` — ${d.days}`;
-      return l;
-    }).join('\n'):'Nenhum médico cadastrado.';
-
-  const intro=isSingle
-    ?`Você é ${clinic.botName}, assistente virtual ${doc.name.startsWith('Dra')?'da':'do'} ${doc.name} (${doc.spec||clinic.name}).`
-    :`Você é ${clinic.botName}, assistente virtual da ${clinic.name}.`;
-
-  return`${intro}
-Objetivo: agendar consultas, cancelar, remarcar e informar os pacientes.
-
-CLÍNICA: ${clinic.name}${clinic.phone?'\nTELEFONE: '+clinic.phone:''}${clinic.hours?'\nHORÁRIOS: '+clinic.hours:''}
-
-${isSingle?`MÉDICO:\n${docList}`:('MÉDICOS:\n'+docList)}
-
-REGRAS ABSOLUTAS:
-1. Fale APENAS dos médicos listados — NUNCA invente outros
-2. CANCELAR → pergunte qual consulta cancelar, NÃO agende nada novo
-3. REMARCAR → cancele a atual e agende uma nova
-4. Para agendar → colete: ${isSingle?'data e horário':'médico, data e horário'} e nome do paciente
-5. Sempre termine com uma pergunta de ação
-6. Para dúvidas complexas → "Vou conectar você com nossa equipe!"
-
-Resposta em português, máx 3 frases. Sem markdown. Emojis com moderação.`;
-}
-
-// ── SCHEDULING FLOW ──
+// ── SCHEDULING FLOW ───────────────────────────────────────────────────────────
 async function handleFlow(from,text,doctors,phone){
   const state=schedulingStates[from]||null;
   const intent=detectIntent(text);
   const t=text.toLowerCase();
   const isSingle=doctors.length===1;
 
-  console.log(`🎯 Intent: ${intent} | State: ${state?.step||'none'} | Perfil: ${isSingle?'single':'multi'}`);
-
   // ── CANCEL ──
   if(intent==='cancel'&&(!state||state.step==='idle')){
     const apts=await getPatientAppointments(phone);
-    if(!apts.length){delete schedulingStates[from];return`Não encontrei consultas agendadas para o seu número. Posso ajudar com outra coisa? 😊`;}
+    if(!apts.length)return`Não encontrei consultas agendadas para o seu número. Posso ajudar com outra coisa? 😊`;
     if(apts.length===1){
       const a=apts[0];const[,mo,d2]=a.date.split('-');
       schedulingStates[from]={step:'confirm_cancel',aptId:a.id,apt:a};
-      return`Encontrei sua consulta: ${a.docName} em ${d2}/${mo} às ${a.time}. Confirma o cancelamento? (responda SIM)`;
+      return`Encontrei: ${a.docName} em ${d2}/${mo} às ${a.time}. Confirma o cancelamento? (SIM ou NÃO)`;
     }
     schedulingStates[from]={step:'choosing_cancel',apts};
-    return`Encontrei ${apts.length} consultas:\n${apts.map((a,i)=>{const[,mo,d2]=a.date.split('-');return`${i+1}. ${a.docName} — ${d2}/${mo} às ${a.time}`;}).join('\n')}\n\nQual deseja cancelar?`;
+    return`Suas consultas:\n${apts.map((a,i)=>{const[,mo,d2]=a.date.split('-');return`${i+1}. ${a.docName} — ${d2}/${mo} às ${a.time}`;}).join('\n')}\n\nQual deseja cancelar?`;
   }
   if(state?.step==='choosing_cancel'){
     const num=parseInt(t.match(/\d/)?.[0]||'0');
     if(num>=1&&num<=state.apts.length){
       const a=state.apts[num-1];const[,mo,d2]=a.date.split('-');
       schedulingStates[from]={step:'confirm_cancel',aptId:a.id,apt:a};
-      return`Consulta: ${a.docName} — ${d2}/${mo} às ${a.time}. Confirma cancelamento? (SIM/NÃO)`;
+      return`${a.docName} — ${d2}/${mo} às ${a.time}. Confirma? (SIM ou NÃO)`;
     }
     return null;
   }
   if(state?.step==='confirm_cancel'){
-    if(['sim','s','confirmo','pode'].some(k=>t.includes(k))){
+    if(['sim','s','confirmo','pode','cancelar'].some(k=>t===k||t.startsWith(k+' ')||t.endsWith(' '+k))){
       const ok=await cancelApt(state.aptId);
       delete schedulingStates[from];
       const[,mo,d2]=state.apt.date.split('-');
-      return ok?`✅ Consulta cancelada! ${state.apt.docName} em ${d2}/${mo} às ${state.apt.time} foi removida. Posso ajudar com mais alguma coisa?`:`Tive dificuldade ao cancelar. Por favor ligue para a clínica.`;
+      return ok?`✅ Consulta cancelada! ${state.apt.docName} em ${d2}/${mo} às ${state.apt.time} foi removida. Posso ajudar com mais alguma coisa?`:`Tive dificuldade ao cancelar. Por favor ligue: ${clinicCache?.clinic?.phone||'para a clínica'}.`;
     }
-    if(['não','nao','n'].some(k=>t===k||t.startsWith(k+' '))){delete schedulingStates[from];return`Entendido! Sua consulta está mantida. 😊`;}
+    if(['não','nao','n'].some(k=>t===k||t.startsWith(k+' '))){delete schedulingStates[from];return`Entendido! Consulta mantida. 😊`;}
     return`Responda SIM para cancelar ou NÃO para manter.`;
   }
 
@@ -254,12 +336,14 @@ async function handleFlow(from,text,doctors,phone){
   if(intent==='reschedule'&&(!state||state.step==='idle')){
     const apts=await getPatientAppointments(phone);
     if(!apts.length){
-      schedulingStates[from]={step:isSingle?'choosing_date':'choosing_doctor',docId:isSingle?doctors[0].id:null,docName:isSingle?doctors[0].name:null};
-      return isSingle?`Vou agendar uma consulta com ${doctors[0].name}! Qual data prefere?`:`Para qual médico gostaria de agendar?\n${doctors.map((d,i)=>`${i+1}. ${d.name}`).join('\n')}`;
+      if(isSingle){schedulingStates[from]={step:'choosing_date',docId:doctors[0].id,docName:doctors[0].name,selectedDoc:doctors[0]};}
+      else{schedulingStates[from]={step:'choosing_doctor'};}
+      return isSingle?`Vou agendar com ${doctors[0].name}! Qual data prefere?`:`Para qual médico gostaria de agendar?\n${doctors.map((d,i)=>`${i+1}. ${d.name} — ${d.spec}`).join('\n')}`;
     }
     if(apts.length===1){
       const a=apts[0];const[,mo,d2]=a.date.split('-');
-      schedulingStates[from]={step:'reschedule_date',aptId:a.id,apt:a,docId:a.docId,docName:a.docName};
+      const doc=doctors.find(d=>d.id===a.docId);
+      schedulingStates[from]={step:'reschedule_date',aptId:a.id,apt:a,docId:a.docId,docName:a.docName,selectedDoc:doc||null};
       return`Remarcando: ${a.docName} de ${d2}/${mo} às ${a.time}. Qual a nova data?`;
     }
     schedulingStates[from]={step:'choosing_reschedule',apts};
@@ -269,7 +353,8 @@ async function handleFlow(from,text,doctors,phone){
     const num=parseInt(t.match(/\d/)?.[0]||'0');
     if(num>=1&&num<=state.apts.length){
       const a=state.apts[num-1];const[,mo,d2]=a.date.split('-');
-      schedulingStates[from]={step:'reschedule_date',aptId:a.id,apt:a,docId:a.docId,docName:a.docName};
+      const doc=doctors.find(d=>d.id===a.docId);
+      schedulingStates[from]={step:'reschedule_date',aptId:a.id,apt:a,docId:a.docId,docName:a.docName,selectedDoc:doc||null};
       return`Remarcando: ${a.docName} de ${d2}/${mo} às ${a.time}. Qual a nova data?`;
     }
     return null;
@@ -277,55 +362,79 @@ async function handleFlow(from,text,doctors,phone){
   if(state?.step==='reschedule_date'){
     const date=parseDateFromText(text);
     if(date){
-      const doc=doctors.find(d=>d.id===state.docId);
+      const doc=state.selectedDoc||doctors.find(d=>d.id===state.docId);
       const allSlots=doc?generateSlots(doc,date):[];
       if(allSlots.length>0){
         const booked=await getBookedTimes(state.docId,date);
         const free=allSlots.filter(s=>!booked.includes(s));
         if(!free.length)return`Todos os horários de ${state.docName} nesta data estão ocupados. Outra data?`;
         await cancelApt(state.aptId);
-        schedulingStates[from]={step:'choosing_time',docId:state.docId,docName:state.docName,date};
+        schedulingStates[from]={step:'choosing_time',docId:state.docId,docName:state.docName,date,selectedDoc:doc};
         return`Horários disponíveis:\n${free.slice(0,6).join(' · ')}\n\nQual prefere?`;
       }
       await cancelApt(state.aptId);
-      schedulingStates[from]={step:'choosing_time_free',docId:state.docId,docName:state.docName,date};
+      schedulingStates[from]={step:'choosing_time_free',docId:state.docId,docName:state.docName,date,selectedDoc:doc};
       const[,mo,d2]=date.split('-');
-      return`Consulta anterior cancelada. Qual horário prefere em ${d2}/${mo}?`;
+      return`Consulta cancelada. Qual horário prefere em ${d2}/${mo}?`;
     }
     return null;
+  }
+
+  // ── DOCTOR SELECTION (multi-clinic entry point) ──
+  if(!state||state.step==='idle'){
+    // Check if patient is mentioning a doctor or specialty
+    const doc=doctors.find(d=>
+      t.includes(d.name.split(' ').pop().toLowerCase())||
+      t.includes(d.name.split(' ')[0].toLowerCase())||
+      (d.spec&&t.includes(d.spec.toLowerCase().split(' ')[0]))
+    );
+    if(doc&&!isSingle){
+      // Patient mentioned a doctor → switch to that doctor's bot
+      schedulingStates[from]={step:'idle',selectedDoc:doc};
+      const gender=doc.name.startsWith('Dra')?'a':'o';
+      return`Olá! Sou ${doc.bot}, assistente d${gender} ${doc.name}. 😊 Como posso ajudar?`;
+    }
   }
 
   // ── SCHEDULE ──
   if(intent==='schedule'&&(!state||state.step==='idle')){
     if(!doctors.length)return null;
     if(isSingle){
-      schedulingStates[from]={step:'choosing_date',docId:doctors[0].id,docName:doctors[0].name};
-      return`Ótimo! Vou agendar com ${doctors[0].name} 😊 Qual data você prefere? (ex: segunda, amanhã, 25/06)`;
+      schedulingStates[from]={step:'choosing_date',docId:doctors[0].id,docName:doctors[0].name,selectedDoc:doctors[0]};
+      return`Ótimo! Vou agendar com ${doctors[0].name} 😊 Qual data prefere? (ex: segunda, amanhã, 25/06)`;
     }
     schedulingStates[from]={step:'choosing_doctor'};
-    return`Temos:\n${doctors.map((d,i)=>`${i+1}. ${d.name} — ${d.spec}`).join('\n')}\n\nQual médico prefere?`;
+    return`Com qual médico você gostaria de agendar?\n${doctors.map((d,i)=>`${i+1}. ${d.name} — ${d.spec}`).join('\n')}`;
   }
   if(state?.step==='choosing_doctor'){
-    const doc=doctors.find(d=>d.name.split(' ').some(p=>t.includes(p.toLowerCase())))||doctors.find((_,i)=>t.includes(String(i+1)));
-    if(doc){schedulingStates[from]={step:'choosing_date',docId:doc.id,docName:doc.name};return`${doc.name}! 😊 Qual data prefere?`;}
+    const doc=doctors.find(d=>
+      d.name.split(' ').some(p=>t.includes(p.toLowerCase()))||
+      (d.spec&&t.includes(d.spec.toLowerCase().split(' ')[0]))
+    )||doctors.find((_,i)=>t.includes(String(i+1)));
+    if(doc){
+      const gender=doc.name.startsWith('Dra')?'a':'o';
+      schedulingStates[from]={step:'choosing_date',docId:doc.id,docName:doc.name,selectedDoc:doc};
+      // Introduce the doctor's bot
+      return`Perfeito! Transferindo para ${doc.bot}, assistente d${gender} ${doc.name}...\n\nOlá! Sou ${doc.bot}! 😊 Qual data prefere para sua consulta com ${doc.name.split(' ')[0]}?`;
+    }
     return null;
   }
   if(state?.step==='choosing_date'){
     const date=parseDateFromText(text);
     if(date){
-      const doc=doctors.find(d=>d.id===state.docId);
+      const doc=state.selectedDoc||doctors.find(d=>d.id===state.docId);
       if(!doc){delete schedulingStates[from];return null;}
       const allSlots=generateSlots(doc,date);
       if(allSlots.length>0){
         const booked=await getBookedTimes(state.docId,date);
         const free=allSlots.filter(s=>!booked.includes(s));
-        if(!free.length)return`Todos os horários de ${doc.name} nesta data estão ocupados. Outra data? 😊`;
+        if(!free.length)return`Todos os horários de ${doc.name.split(' ')[0]} nesta data estão ocupados. Outra data? 😊`;
         schedulingStates[from]={...state,step:'choosing_time',date};
-        return`Horários disponíveis com ${doc.name}:\n${free.slice(0,6).join(' · ')}\n\nQual prefere?`;
+        return`Horários disponíveis com ${doc.name.split(' ')[0]}:\n${free.slice(0,6).join(' · ')}\n\nQual prefere?`;
       }
       schedulingStates[from]={...state,step:'choosing_time_free',date};
       const[,mo,d2]=date.split('-');
-      return`Qual horário prefere em ${d2}/${mo}?`;
+      return`Qual horário prefere em ${d2}/${mo}? (ex: 9h, 14h30)`;
     }
     return null;
   }
@@ -336,57 +445,53 @@ async function handleFlow(from,text,doctors,phone){
     if(tm)time=`${String(tm[1]).padStart(2,'0')}:${String(tm[2]||'00').padStart(2,'0')}`;
     else if(nm)time=`${String(nm[1]).padStart(2,'0')}:00`;
     if(time){
-      const doc=doctors.find(d=>d.id===state.docId);
-      // LUNCH BREAK VALIDATION — never allow lunch hours
-      if(doc&&doc.schedLunchStart&&doc.schedLunchEnd){
-        const tMin=parseTimeM(time);
-        const lsMin=parseTimeM(doc.schedLunchStart);
-        const leMin=parseTimeM(doc.schedLunchEnd);
-        if(tMin>=lsMin&&tMin<leMin){
-          return`Este é o horário de almoço de ${doc.name}. Por favor escolha um horário antes das ${doc.schedLunchStart} ou após as ${doc.schedLunchEnd}. 😊`;
-        }
+      const doc=state.selectedDoc||doctors.find(d=>d.id===state.docId);
+      // Lunch block
+      if(doc?.schedLunchStart&&doc?.schedLunchEnd){
+        const tMin=parseTimeM(time),ls=parseTimeM(doc.schedLunchStart),le=parseTimeM(doc.schedLunchEnd);
+        if(tMin>=ls&&tMin<le)return`Este é o horário de almoço. Escolha antes das ${doc.schedLunchStart} ou após as ${doc.schedLunchEnd}. 😊`;
       }
-      // Validate slot still free (race condition protection)
+      // Double booking check
       if(state.step==='choosing_time'){
-        const taken=await isSlotTaken(state.docId,state.date,time);
-        if(taken){
+        if(await isSlotTaken(state.docId,state.date,time)){
           const booked=await getBookedTimes(state.docId,state.date);
           const allSlots=doc?generateSlots(doc,state.date):[];
           const free=allSlots.filter(s=>!booked.includes(s));
-          if(free.length)return`Infelizmente ${time} acabou de ser reservado. Horários ainda disponíveis:\n${free.slice(0,5).join(' · ')}\n\nQual prefere?`;
-          return`Todos os horários acabaram de ser reservados. Gostaria de escolher outro dia?`;
+          if(free.length)return`${time} acabou de ser reservado. Horários livres:\n${free.slice(0,5).join(' · ')}\n\nQual prefere?`;
+          return`Todos os horários foram reservados. Gostaria de outro dia?`;
         }
       }
-      // Show price at penultimate step (just before asking the name)
-      const priceMsg=doc&&doc.preco?`\n💰 Valor da consulta: ${doc.preco}.`:'';
+      // Show price before asking name
+      const priceMsg=doc?.preco?`\n💰 Valor da consulta: ${doc.preco}.`:'';
       schedulingStates[from]={...state,step:'getting_name',time};
       return`✅ ${time} reservado!${priceMsg}\n\nQual é o seu nome completo para confirmar? 😊`;
     }
     return null;
   }
-
   if(state?.step==='getting_name'){
     const name=text.trim();
     if(name.length>2){
-      // FINAL CHECK — anti double booking antes de salvar
-      const taken=await isSlotTaken(state.docId,state.date,state.time);
-      if(taken){
+      if(await isSlotTaken(state.docId,state.date,state.time)){
         delete schedulingStates[from];
-        return`Puxa, ${state.time} acabou de ser reservado por outra pessoa! Gostaria de escolher outro horário?`;
+        return`Puxa, ${state.time} foi reservado agora! Gostaria de outro horário?`;
       }
       const result=await bookSlot(state.docId,state.docName,name,phone,state.date,state.time);
+      const doc=state.selectedDoc;
+      const botName=doc?.bot||clinicCache?.clinic?.botName||'Sofia';
       delete schedulingStates[from];
       const[,mo,d2]=state.date.split('-');
-      if(result==='ok')return`✅ Agendado! ${name}, sua consulta com ${state.docName} está confirmada para ${d2}/${mo} às ${state.time}. Enviaremos um lembrete! 😊`;
-      if(result==='taken')return`Esse horário acabou de ser reservado. Gostaria de escolher outro?`;
-      return`Tive uma dificuldade técnica. Por favor ligue para a clínica: ${clinicCache?.clinic?.phone||'nosso telefone'} 🙏`;
+      // Keep selectedDoc in state after booking (for continued conversation)
+      if(doc)schedulingStates[from]={step:'idle',selectedDoc:doc};
+      if(result==='ok')return`✅ Agendado! ${name}, sua consulta com ${state.docName} está confirmada para ${d2}/${mo} às ${state.time}. Enviarei um lembrete! 😊`;
+      if(result==='taken')return`Esse horário acabou de ser reservado. Gostaria de outro?`;
+      return`Tive uma dificuldade técnica. Por favor ligue: ${clinicCache?.clinic?.phone||'para a clínica'} 🙏`;
     }
     return null;
   }
   return null;
 }
 
-// ── PROCESS MESSAGE ──
+// ── PROCESS MESSAGE ───────────────────────────────────────────────────────────
 async function processMessage(body){
   try{
     if(body?.data?.key?.fromMe)return;
@@ -394,44 +499,85 @@ async function processMessage(body){
     const text=body?.data?.message?.conversation||body?.data?.message?.extendedTextMessage?.text;
     const from=body?.data?.key?.remoteJid;
     if(!from||!text)return;
+
     const phone=formatPhone(from);
-    const name=body?.data?.pushName||phone;
+    const pushName=body?.data?.pushName||phone;
     const now=new Date().toLocaleTimeString('pt-BR',{hour:'2-digit',minute:'2-digit'});
-    console.log(`\n📩 ${name} (${phone}): ${text}`);
+    console.log(`\n📩 ${pushName} (${phone}): ${text}`);
+
+    // Load clinic data (30s cache, with retry)
     const{clinic,doctors}=await getClinicData();
+
+    // Check if doctors loaded correctly
+    if(!doctors.length){
+      console.warn('⚠️ Zero médicos — retrying Firebase...');
+      clinicCache=null; // force refresh
+      await getClinicData();
+    }
+
+    // Try scheduling flow first
     const flowReply=await handleFlow(from,text,doctors,phone);
-    if(!conversations[from])conversations[from]=[];
-    conversations[from].push({role:'user',content:text});
-    if(conversations[from].length>20)conversations[from]=conversations[from].slice(-20);
+
+    // Load conversation history from Firebase
+    let history=await loadHistory(phone);
+    history.push({role:'user',content:text});
+    if(history.length>20)history=history.slice(-20);
+
     let reply;
     if(flowReply){
       reply=flowReply;
-      conversations[from].push({role:'assistant',content:reply});
+      history.push({role:'assistant',content:reply});
     }else{
+      // Determine which prompt to use based on selected doctor
+      const state=schedulingStates[from];
+      const selectedDoc=state?.selectedDoc||(doctors.length===1?doctors[0]:null);
+
+      let systemPrompt;
+      if(selectedDoc){
+        systemPrompt=buildDoctorPrompt(clinic,selectedDoc);
+        console.log(`🤖 Usando persona: ${selectedDoc.bot} (${selectedDoc.name})`);
+      }else{
+        systemPrompt=buildClinicPrompt(clinic,doctors);
+        console.log(`🏥 Usando persona: ${clinic.botName} (recepcionista)`);
+      }
+
       const res=await fetch('https://api.anthropic.com/v1/messages',{
         method:'POST',
         headers:{'Content-Type':'application/json','x-api-key':ANTHROPIC_KEY,'anthropic-version':'2023-06-01'},
-        body:JSON.stringify({model:'claude-sonnet-4-6',max_tokens:500,system:buildPrompt(clinic,doctors),messages:conversations[from]}),
+        body:JSON.stringify({model:'claude-sonnet-4-6',max_tokens:500,system:systemPrompt,messages:history}),
       });
       const data=await res.json();
       reply=data.content?.[0]?.text;
-      if(!reply){console.log('❌ No Claude reply');return;}
-      conversations[from].push({role:'assistant',content:reply});
+      if(!reply){console.log('❌ No Claude reply:',JSON.stringify(data));return;}
+      history.push({role:'assistant',content:reply});
     }
-    console.log(`🤖 ${clinic.botName}: ${reply}`);
+
+    const botName=(schedulingStates[from]?.selectedDoc?.bot)||(doctors.length===1?doctors[0]?.bot:null)||clinic.botName;
+    console.log(`🤖 ${botName}: ${reply}`);
+
+    // Persist history to Firebase (async, don't await)
+    saveHistory(phone,history);
+
+    // Save conversation to Firebase dashboard
     const isHuman=detectIntent(text)==='human'||reply.includes('equipe')||reply.includes('transferir');
-    const msgs=conversations[from].map(m=>({f:m.role==='user'?'p':'b',t:m.content,h:now}));
-    await saveConversation(phone,name,reply,isHuman?'human':'bot',msgs);
+    saveConversation(phone,pushName,reply,isHuman?'human':'bot');
+
+    // Send reply via Evolution API
     await fetch(`${EVOLUTION_URL}/message/sendText/${INSTANCE}`,{
-      method:'POST',headers:{'Content-Type':'application/json',apikey:EVOLUTION_KEY},
+      method:'POST',
+      headers:{'Content-Type':'application/json',apikey:EVOLUTION_KEY},
       body:JSON.stringify({number:from,text:reply}),
     });
-    console.log('✅ Sent!');
-  }catch(err){console.error('❌ Error:',err.message);}
+    console.log('✅ Enviado!');
+
+  }catch(err){
+    console.error('❌ processMessage error:',err.message);
+  }
 }
 
 app.post('/webhook',(req,res)=>{res.status(200).send('OK');processMessage(req.body);});
 app.post('/webhook/*',(req,res)=>{res.status(200).send('OK');processMessage(req.body);});
-app.get('/',(req,res)=>res.json({status:'✅ BotClínica v3.0',uid:CLINIC_UID}));
+app.get('/',(req,res)=>res.json({status:'✅ BotClínica v4.0',features:['multi-bot-persona','persistent-history','anti-double-booking','lunch-block']}));
+
 const PORT=process.env.PORT||3000;
-app.listen(PORT,()=>console.log(`🚀 BotClínica v3.0 porta ${PORT}`));
+app.listen(PORT,()=>console.log(`🚀 BotClínica v4.0 porta ${PORT}`));
